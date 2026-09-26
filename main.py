@@ -4,10 +4,11 @@ import sys
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QApplication, QComboBox, QFormLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-                               QMessageBox, QPlainTextEdit, QPushButton,
-                               QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFormLayout,
+                               QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+                               QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+                               QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget,
+                               QVBoxLayout, QWidget)
 
 import windows_ics
 
@@ -83,6 +84,8 @@ class IcsManager(QMainWindow):
         self._sharing = []
         self._share_ip_touched = False
         self._client_ip_touched = False
+        self._metric_spins = {}
+        self._metric_originals = {}
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -99,6 +102,7 @@ class IcsManager(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_share_tab(), "Share Internet (Server)")
         self.tabs.addTab(self._build_client_tab(), "Configure Client")
+        self.tabs.addTab(self._build_metrics_tab(), "Adapter Metrics")
         main_layout.addWidget(self.tabs, 3)
 
         log_group = QGroupBox("Output")
@@ -201,6 +205,72 @@ class IcsManager(QMainWindow):
         layout.addStretch(1)
         return widget
 
+    def _build_metrics_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        hint = QLabel(
+            "The interface metric decides which adapter is preferred when Windows chooses a route; "
+            "lower values are preferred. Applying a metric disables automatic metric selection for that adapter."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #555;")
+        layout.addWidget(hint)
+
+        self.metrics_table = QTableWidget(0, 5)
+        self.metrics_table.setHorizontalHeaderLabels(["Adapter", "Description", "Status", "IPv4 addresses", "Metric"])
+        self.metrics_table.verticalHeader().setVisible(False)
+        self.metrics_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.metrics_table.setSelectionMode(QAbstractItemView.NoSelection)
+        header = self.metrics_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        layout.addWidget(self.metrics_table, 1)
+
+        button_layout = QHBoxLayout()
+        self.apply_metrics_button = QPushButton("Apply Metrics")
+        self.apply_metrics_button.clicked.connect(self.apply_metrics)
+        button_layout.addWidget(self.apply_metrics_button)
+        button_layout.addStretch(1)
+        layout.addLayout(button_layout)
+
+        self.metrics_label = QLabel("Adapter metrics have not been loaded yet.")
+        self.metrics_label.setWordWrap(True)
+        layout.addWidget(self.metrics_label)
+
+        return widget
+
+    def apply_metrics(self):
+        changes = []
+        for name, spin in self._metric_spins.items():
+            original = self._metric_originals.get(name)
+            if original is None:
+                continue
+            if spin.value() != original:
+                changes.append((name, spin.value(), original))
+        if not changes:
+            QMessageBox.information(self, "No changes", "No interface metric was modified.")
+            return
+        descriptions = "\n".join(f"{name}: {old} -> {new}" for name, new, old in changes)
+        answer = QMessageBox.question(
+            self,
+            "Apply interface metrics",
+            f"Apply the following interface metric changes?\n\n{descriptions}",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        snapshot = {}
+
+        def task(log):
+            for name, new_metric, _old in changes:
+                windows_ics.set_interface_metric(name, new_metric, on_output=log)
+            snapshot.update(windows_ics.get_network_snapshot())
+
+        self._run_task("Updating interface metrics...", task, lambda: self._apply_snapshot(snapshot))
+
     def refresh_network(self):
         if self._busy:
             return
@@ -244,6 +314,49 @@ class IcsManager(QMainWindow):
         self._suggest_share_ip()
         self._update_share_hint()
         self._suggest_client_ip()
+        self._populate_metrics()
+
+    def _populate_metrics(self):
+        self.metrics_table.setRowCount(0)
+        self._metric_spins = {}
+        self._metric_originals = {}
+        adapters = sorted(
+            self._adapters,
+            key=lambda adapter: (
+                adapter.get("Metric") is None,
+                adapter.get("Metric") if adapter.get("Metric") is not None else 0,
+            ),
+        )
+        for adapter in adapters:
+            row = self.metrics_table.rowCount()
+            self.metrics_table.insertRow(row)
+            name = adapter.get("Name", "?")
+            addresses = adapter.get("IPv4") or []
+            if isinstance(addresses, str):
+                addresses = [addresses]
+            self.metrics_table.setItem(row, 0, QTableWidgetItem(name))
+            self.metrics_table.setItem(row, 1, QTableWidgetItem(str(adapter.get("Description", ""))))
+            self.metrics_table.setItem(row, 2, QTableWidgetItem(str(adapter.get("Status", "?"))))
+            self.metrics_table.setItem(row, 3, QTableWidgetItem(", ".join(addresses) or "-"))
+            metric = adapter.get("Metric")
+            spin = QSpinBox()
+            spin.setRange(1, 9999)
+            if isinstance(metric, int) and metric > 9999:
+                spin.setMaximum(metric)
+            if isinstance(metric, int) and metric >= 1:
+                spin.setValue(metric)
+            else:
+                spin.setValue(1)
+                spin.setEnabled(False)
+            if adapter.get("AutomaticMetric") == "Enabled" and metric is not None:
+                spin.setToolTip("This adapter currently uses an automatic metric.")
+            self.metrics_table.setCellWidget(row, 4, spin)
+            self._metric_spins[name] = spin
+            if metric is not None:
+                self._metric_originals[name] = int(metric)
+        self.metrics_label.setText(
+            f"{len(self._metric_spins)} adapter(s) loaded. Edit a metric and press Apply Metrics to change it."
+        )
 
     def _fill_adapter_combo(self, combo, preferred=None):
         current = self._selected_adapter(combo) or preferred
@@ -536,6 +649,8 @@ class IcsManager(QMainWindow):
             self.client_ip_edit,
             self.client_prefix_spin,
             self.dns_edit,
+            self.metrics_table,
+            self.apply_metrics_button,
         ):
             widget.setEnabled(not busy)
 

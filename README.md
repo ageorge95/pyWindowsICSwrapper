@@ -16,6 +16,11 @@ A small PySide6 GUI that makes sharing an internet connection on Windows quick a
 - one button to return the adapter to DHCP
 - connectivity diagnostics: ping the server, ping the internet, DNS lookup
 
+**Adapter Metrics tab**
+- lists all adapters with their IPv4 interface metric, sorted lowest (preferred) first
+- lets you edit the metric of each adapter and apply the changes
+- applying a metric disables automatic metric selection for that adapter
+
 Administrator rights are required; the app relaunches itself elevated through UAC when needed.
 
 # Usage

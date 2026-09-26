@@ -19,17 +19,25 @@ _SNAPSHOT_SCRIPT = r"""
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+$interfaceLookup = @{}
+foreach ($interface in (Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+    $interfaceLookup[[int]$interface.ifIndex] = $interface
+}
+
 $adapterList = foreach ($adapter in (Get-NetAdapter | Sort-Object ifIndex)) {
     $addresses = @(Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.IPAddress -notlike '169.254.*' } |
         Select-Object -ExpandProperty IPAddress)
+    $interface = $interfaceLookup[[int]$adapter.ifIndex]
     [pscustomobject]@{
-        Name        = $adapter.Name
-        Description = $adapter.InterfaceDescription
-        Status      = [string]$adapter.Status
-        IfIndex     = $adapter.ifIndex
-        MacAddress  = $adapter.MacAddress
-        IPv4        = $addresses
+        Name            = $adapter.Name
+        Description     = $adapter.InterfaceDescription
+        Status          = [string]$adapter.Status
+        IfIndex         = $adapter.ifIndex
+        MacAddress      = $adapter.MacAddress
+        IPv4            = $addresses
+        Metric          = if ($interface) { [int]$interface.InterfaceMetric } else { $null }
+        AutomaticMetric = if ($interface) { [string]$interface.AutomaticMetric } else { $null }
     }
 }
 
@@ -300,6 +308,32 @@ Write-Output ("{0} now uses DHCP." -f $AdapterName)
 """
 
 
+_METRIC_SCRIPT = r"""
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][string]$AdapterName,
+    [Parameter(Mandatory = $true)][int]$Metric
+)
+
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+if (-not (Get-NetAdapter -Name $AdapterName -ErrorAction SilentlyContinue)) {
+    throw "Adapter not found: $AdapterName"
+}
+if ($Metric -lt 1 -or $Metric -gt 9999) {
+    throw "Metric must be between 1 and 9999."
+}
+if (-not (Get-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+    throw "Adapter has no IPv4 interface: $AdapterName"
+}
+
+Write-Output ("Setting IPv4 metric of {0} to {1} (automatic metric disabled)..." -f $AdapterName, $Metric)
+Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric $Metric
+Write-Output ("{0} now has IPv4 metric {1}." -f $AdapterName, $Metric)
+"""
+
+
 _DIAGNOSTICS_SCRIPT = r"""
 [CmdletBinding()]
 param(
@@ -448,6 +482,14 @@ def configure_client(adapter_name, server_ip, client_ip, prefix_length=24, dns="
 
 def set_client_dhcp(adapter_name, on_output=None):
     return run_powershell_script(_DHCP_SCRIPT, {"AdapterName": adapter_name}, on_output=on_output)
+
+
+def set_interface_metric(adapter_name, metric, on_output=None):
+    return run_powershell_script(
+        _METRIC_SCRIPT,
+        {"AdapterName": adapter_name, "Metric": int(metric)},
+        on_output=on_output,
+    )
 
 
 def test_connectivity(server_ip, timeout=60):
