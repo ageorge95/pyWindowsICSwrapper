@@ -4,11 +4,11 @@ import sys
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFormLayout,
-                               QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                               QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-                               QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
+                               QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+                               QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+                               QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
+                               QTabWidget, QVBoxLayout, QWidget)
 
 import windows_ics
 
@@ -93,9 +93,17 @@ class IcsManager(QMainWindow):
 
         top_layout = QHBoxLayout()
         self.status_label = QLabel("Loading network information...")
+        self.google_dns_checkbox = QCheckBox("Use Google DNS when resetting")
+        self.google_dns_checkbox.setChecked(True)
+        self.google_dns_checkbox.setToolTip(
+            "When enabled, reset actions set Google Public DNS on the affected adapter:\n"
+            f"IPv4: {', '.join(windows_ics.GOOGLE_DNS_V4)}\n"
+            f"IPv6: {', '.join(windows_ics.GOOGLE_DNS_V6)}"
+        )
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh_network)
         top_layout.addWidget(self.status_label, 1)
+        top_layout.addWidget(self.google_dns_checkbox)
         top_layout.addWidget(self.refresh_button)
         main_layout.addLayout(top_layout)
 
@@ -493,17 +501,24 @@ class IcsManager(QMainWindow):
         self._run_task(f"Enabling sharing on {private}...", task, lambda: self._apply_snapshot(snapshot))
 
     def disable_sharing(self):
-        answer = QMessageBox.question(
-            self,
-            "Disable sharing",
-            "Disable Internet Connection Sharing on all adapters and reset the ICS scope to 192.168.137.1?",
+        set_google_dns = self.google_dns_checkbox.isChecked()
+        message = (
+            "Disable Internet Connection Sharing on all adapters and "
+            "reset the ICS scope to 192.168.137.1?"
         )
+        if set_google_dns:
+            message += (
+                "\n\nGoogle Public DNS will be set on the adapter(s) that were sharing:"
+                f"\nIPv4: {', '.join(windows_ics.GOOGLE_DNS_V4)}"
+                f"\nIPv6: {', '.join(windows_ics.GOOGLE_DNS_V6)}"
+            )
+        answer = QMessageBox.question(self, "Disable sharing", message)
         if answer != QMessageBox.Yes:
             return
         snapshot = {}
 
         def task(log):
-            windows_ics.disable_all_sharing(on_output=log)
+            windows_ics.disable_all_sharing(set_google_dns=set_google_dns, on_output=log)
             snapshot.update(windows_ics.get_network_snapshot())
 
         self._run_task("Disabling Internet Connection Sharing...", task, lambda: self._apply_snapshot(snapshot))
@@ -561,17 +576,21 @@ class IcsManager(QMainWindow):
         if not adapter:
             QMessageBox.warning(self, "Missing adapter", "Select the client adapter.")
             return
-        answer = QMessageBox.question(
-            self,
-            "Return to DHCP",
-            f'Enable DHCP and remove the static IP configuration from "{adapter}"?',
-        )
+        set_google_dns = self.google_dns_checkbox.isChecked()
+        message = f'Enable DHCP and remove the static IP configuration from "{adapter}"?'
+        if set_google_dns:
+            message += (
+                "\n\nGoogle Public DNS will be configured:"
+                f"\nIPv4: {', '.join(windows_ics.GOOGLE_DNS_V4)}"
+                f"\nIPv6: {', '.join(windows_ics.GOOGLE_DNS_V6)}"
+            )
+        answer = QMessageBox.question(self, "Return to DHCP", message)
         if answer != QMessageBox.Yes:
             return
         snapshot = {}
 
         def task(log):
-            windows_ics.set_client_dhcp(adapter, on_output=log)
+            windows_ics.set_client_dhcp(adapter, set_google_dns=set_google_dns, on_output=log)
             snapshot.update(windows_ics.get_network_snapshot())
 
         self._run_task(f"Returning {adapter} to DHCP...", task, lambda: self._apply_snapshot(snapshot))
@@ -635,6 +654,7 @@ class IcsManager(QMainWindow):
         self._busy = busy
         for widget in (
             self.refresh_button,
+            self.google_dns_checkbox,
             self.enable_button,
             self.disable_button,
             self.apply_client_button,

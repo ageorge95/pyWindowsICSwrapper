@@ -9,6 +9,8 @@ CREATE_NO_WINDOW = 0x08000000
 POWERSHELL = "powershell.exe"
 DEFAULT_TIMEOUT = 300
 DEFAULT_ICS_SCOPE = "192.168.137.1"
+GOOGLE_DNS_V4 = ("8.8.8.8", "8.8.4.4")
+GOOGLE_DNS_V6 = ("2001:4860:4860::8888", "2001:4860:4860::8844")
 
 
 class IcsError(RuntimeError):
@@ -190,16 +192,35 @@ Write-Output ("Clients must use gateway and DNS {0}." -f $ShareIP)
 
 
 _DISABLE_SCRIPT = r"""
+[CmdletBinding()]
+param(
+    [switch]$SetGoogleDns,
+    [string]$GoogleDnsV4 = "8.8.8.8,8.8.4.4",
+    [string]$GoogleDnsV6 = "2001:4860:4860::8888,2001:4860:4860::8844"
+)
+
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $RegistryKey = "HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters"
+$DnsV4 = @($GoogleDnsV4.Split(",;".ToCharArray()) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$DnsV6 = @($GoogleDnsV6.Split(",;".ToCharArray()) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
+function Set-GoogleDns([string]$Name) {
+    Write-Output ("Setting Google DNS on {0}..." -f $Name)
+    Set-DnsClientServerAddress -InterfaceAlias $Name -ServerAddresses @($DnsV4 + $DnsV6)
+    Clear-DnsClientCache -ErrorAction SilentlyContinue
+}
+
+$privateAdapters = @()
 $sharing = New-Object -ComObject HNetCfg.HNetShare
 foreach ($connection in $sharing.EnumEveryConnection) {
     $properties = $sharing.NetConnectionProps($connection)
     $configuration = $sharing.INetSharingConfigurationForINetConnection($connection)
     if ($configuration.SharingEnabled) {
+        if ([int]$configuration.SharingConnectionType -eq 1) {
+            $privateAdapters += $properties.Name
+        }
         Write-Output ("Disabling ICS on {0}" -f $properties.Name)
         $configuration.DisableSharing()
     }
@@ -209,6 +230,17 @@ Set-ItemProperty -Path $RegistryKey -Name ScopeAddress -Value "192.168.137.1"
 Set-ItemProperty -Path $RegistryKey -Name ScopeAddressBackup -Value "192.168.137.1"
 Set-ItemProperty -Path $RegistryKey -Name StandaloneDhcpAddress -Value "192.168.137.1"
 Write-Output "Sharing disabled and ICS scope reset to default (192.168.137.1)."
+
+if ($SetGoogleDns) {
+    $privateAdapters = @($privateAdapters | Select-Object -Unique)
+    if ($privateAdapters.Count -eq 0) {
+        Write-Output "No ICS private adapter was found; DNS was left unchanged."
+    } else {
+        foreach ($name in $privateAdapters) {
+            Set-GoogleDns $name
+        }
+    }
+}
 """
 
 
@@ -290,11 +322,23 @@ Write-Output ("{0} is configured. Gateway and DNS: {1}." -f $AdapterName, $Serve
 _DHCP_SCRIPT = r"""
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$AdapterName
+    [Parameter(Mandatory = $true)][string]$AdapterName,
+    [switch]$SetGoogleDns,
+    [string]$GoogleDnsV4 = "8.8.8.8,8.8.4.4",
+    [string]$GoogleDnsV6 = "2001:4860:4860::8888,2001:4860:4860::8844"
 )
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+$DnsV4 = @($GoogleDnsV4.Split(",;".ToCharArray()) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$DnsV6 = @($GoogleDnsV6.Split(",;".ToCharArray()) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+function Set-GoogleDns([string]$Name) {
+    Write-Output ("Setting Google DNS on {0}..." -f $Name)
+    Set-DnsClientServerAddress -InterfaceAlias $Name -ServerAddresses @($DnsV4 + $DnsV6)
+    Clear-DnsClientCache -ErrorAction SilentlyContinue
+}
 
 if (-not (Get-NetAdapter -Name $AdapterName -ErrorAction SilentlyContinue)) {
     throw "Adapter not found: $AdapterName"
@@ -303,7 +347,11 @@ if (-not (Get-NetAdapter -Name $AdapterName -ErrorAction SilentlyContinue)) {
 Write-Output ("Returning {0} to DHCP..." -f $AdapterName)
 Set-NetIPInterface -InterfaceAlias $AdapterName -AddressFamily IPv4 -Dhcp Enabled
 Remove-NetIPAddress -InterfaceAlias $AdapterName -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
-Set-DnsClientServerAddress -InterfaceAlias $AdapterName -ResetServerAddresses
+if ($SetGoogleDns) {
+    Set-GoogleDns $AdapterName
+} else {
+    Set-DnsClientServerAddress -InterfaceAlias $AdapterName -ResetServerAddresses
+}
 Write-Output ("{0} now uses DHCP." -f $AdapterName)
 """
 
@@ -462,8 +510,16 @@ def enable_sharing(public_adapter, private_adapter, share_ip, prefix_length=24, 
     )
 
 
-def disable_all_sharing(on_output=None):
-    return run_powershell_script(_DISABLE_SCRIPT, on_output=on_output)
+def disable_all_sharing(set_google_dns=True, on_output=None):
+    return run_powershell_script(
+        _DISABLE_SCRIPT,
+        {
+            "SetGoogleDns": bool(set_google_dns),
+            "GoogleDnsV4": ",".join(GOOGLE_DNS_V4),
+            "GoogleDnsV6": ",".join(GOOGLE_DNS_V6),
+        },
+        on_output=on_output,
+    )
 
 
 def configure_client(adapter_name, server_ip, client_ip, prefix_length=24, dns="", on_output=None):
@@ -480,8 +536,17 @@ def configure_client(adapter_name, server_ip, client_ip, prefix_length=24, dns="
     )
 
 
-def set_client_dhcp(adapter_name, on_output=None):
-    return run_powershell_script(_DHCP_SCRIPT, {"AdapterName": adapter_name}, on_output=on_output)
+def set_client_dhcp(adapter_name, set_google_dns=True, on_output=None):
+    return run_powershell_script(
+        _DHCP_SCRIPT,
+        {
+            "AdapterName": adapter_name,
+            "SetGoogleDns": bool(set_google_dns),
+            "GoogleDnsV4": ",".join(GOOGLE_DNS_V4),
+            "GoogleDnsV6": ",".join(GOOGLE_DNS_V6),
+        },
+        on_output=on_output,
+    )
 
 
 def set_interface_metric(adapter_name, metric, on_output=None):
