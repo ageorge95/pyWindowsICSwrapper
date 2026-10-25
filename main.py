@@ -1,6 +1,7 @@
 import ipaddress
 import os
 import sys
+import ctypes
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QIcon
@@ -13,15 +14,24 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
 import windows_ics
 
 
+APP_ID = 'AG95.pyWindowsICSwrapper'
+ICON_FILE = 'icon.ico'
+
+
 def get_running_path(relative_path):
-    if os.path.exists(relative_path):
-        return relative_path
-    if getattr(sys, "frozen", False):
-        base_directory = os.path.join(os.path.dirname(sys.executable), "_internal")
-    else:
-        base_directory = os.path.dirname(os.path.abspath(__file__))
-    candidate = os.path.join(base_directory, relative_path)
-    return candidate if os.path.exists(candidate) else relative_path
+    """Return a bundled file's path in both source and PyInstaller builds."""
+    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
+
+def set_windows_app_id():
+    """Give the app its own Windows taskbar identity."""
+    if sys.platform != 'win32':
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except (AttributeError, OSError):
+        pass
 
 
 def parse_ipv4(text):
@@ -76,7 +86,7 @@ class IcsManager(QMainWindow):
             version = version_file.read().strip()
         self.setWindowTitle(f"Windows ICS Manager V{version}")
         self.resize(1020, 800)
-        self.setWindowIcon(QIcon(get_running_path("icon.ico")))
+        self.setWindowIcon(QIcon(get_running_path(ICON_FILE)))
 
         self._busy = False
         self._workers = []
@@ -689,10 +699,12 @@ class IcsManager(QMainWindow):
 
 
 def main():
+    set_windows_app_id()
     if not windows_ics.is_admin():
         if "--relaunched" not in sys.argv and windows_ics.relaunch_as_admin(["--relaunched"]):
             return 0
         app = QApplication(sys.argv)
+        app.setWindowIcon(QIcon(get_running_path(ICON_FILE)))
         QMessageBox.critical(
             None,
             "Administrator rights required",
@@ -700,6 +712,7 @@ def main():
         )
         return 1
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(get_running_path(ICON_FILE)))
     window = IcsManager()
     window.show()
     return app.exec()
